@@ -91,47 +91,61 @@ def _validate_debug_pre_roll(config):
     return config
 
 
+_UPGRADING_ESPHOME = '"Upgrading ESPHome" in voice-pe/PRE_ROLL.md, in maguerrieri/home.'
+
+
 # Local patch: this component is built with the rest of the ESPHome release that
 # voice-pe last merged (maguerrieri/home voice-pe/PRE_ROLL.md), so it refuses to
 # build with any other. It reads that release from the esphome/const.py beside
 # esphome/components/ in the same tree, which every merge updates.
-def _merged_esphome_release() -> str | None:
+def _merged_esphome_release() -> str:
     import ast
     from pathlib import Path
 
     const = Path(__file__).resolve().parents[2] / "const.py"
     try:
-        tree = ast.parse(const.read_text())
-    except (OSError, SyntaxError):
-        return None
+        tree = ast.parse(const.read_text(), str(const))
+    except OSError as err:
+        raise cv.Invalid(
+            f"This voice_assistant is maguerrieri/esphome's voice-pe, but it can't read "
+            f"{const} ({err.strerror}) to tell which ESPHome release it was merged with. "
+            f"Load it from the fork itself: {_UPGRADING_ESPHOME}"
+        ) from err
+    except SyntaxError as err:
+        raise cv.Invalid(
+            f"This voice_assistant is maguerrieri/esphome's voice-pe, but it can't parse "
+            f"{const} ({err.msg}) to tell which ESPHome release it was merged with."
+        ) from err
     for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        else:
+            continue
         if (
-            isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
+            isinstance(target, ast.Name)
+            and target.id == "__version__"
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
         ):
-            return node.value.value
-    return None
+            return value.value
+    raise cv.Invalid(
+        f"This voice_assistant is maguerrieri/esphome's voice-pe, but {const} has no "
+        '__version__ = "<release>" to tell which ESPHome release it was merged with, '
+        "so the guard needs updating for it."
+    )
 
 
 def _validate_esphome_version(config):
     from esphome.const import __version__
 
     merged = _merged_esphome_release()
-    if merged is None:
-        raise cv.Invalid(
-            "This voice_assistant is maguerrieri/esphome's voice-pe, but there's no "
-            "esphome/const.py beside it to say which ESPHome release it was merged with. "
-            "Load it from the fork itself: "
-            '"Upgrading ESPHome" in voice-pe/PRE_ROLL.md, in maguerrieri/home.'
-        )
     if __version__ != merged:
         raise cv.Invalid(
             f"This voice_assistant is maguerrieri/esphome's voice-pe for ESPHome {merged}, "
             f"but this is ESPHome {__version__}. Load the commit of a voice-pe tag for "
-            "this version, merging the release first if there isn't one: "
-            '"Upgrading ESPHome" in voice-pe/PRE_ROLL.md, in maguerrieri/home.'
+            f"this version, merging the release first if there isn't one: {_UPGRADING_ESPHOME}"
         )
     return config
 
