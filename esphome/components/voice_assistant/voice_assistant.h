@@ -27,6 +27,12 @@
 #include <span>
 #include <vector>
 
+#ifdef USE_VOICE_ASSISTANT_DEBUG_PRE_ROLL
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
+
 namespace esphome::voice_assistant {
 
 // Version 1: Initial version
@@ -188,6 +194,12 @@ class VoiceAssistant final : public Component {
   void set_use_wake_word(bool use_wake_word) { this->use_wake_word_ = use_wake_word; }
   // Local patch: audio kept from before a wake-word start (0 = stock behavior).
   void set_pre_roll_ms(uint32_t pre_roll_ms) { this->pre_roll_ms_ = pre_roll_ms; }
+  // Local patch: audio from before the pre-roll, uploaded to a URL as a WAV after a
+  // wake-word start. The max sizes the buffers; set_debug_pre_roll_ms lowers it at
+  // runtime (0 = no upload).
+  void set_debug_pre_roll_max_ms(uint32_t ms) { this->debug_pre_roll_max_ms_ = this->debug_pre_roll_ms_ = ms; }
+  void set_debug_pre_roll_ms(uint32_t ms) { this->debug_pre_roll_ms_ = std::min(ms, this->debug_pre_roll_max_ms_); }
+  void set_debug_pre_roll_url(const char *url) { this->debug_pre_roll_url_ = url; }
 
   void set_noise_suppression_level(uint8_t noise_suppression_level) {
     this->noise_suppression_level_ = noise_suppression_level;
@@ -240,6 +252,22 @@ class VoiceAssistant final : public Component {
   size_t ring_buffer_size_() const;
   uint32_t pre_roll_ms_{0};
   bool pre_roll_alloc_failed_{false};
+  uint32_t debug_pre_roll_ms_{0};
+  uint32_t debug_pre_roll_max_ms_{0};
+  const char *debug_pre_roll_url_{nullptr};
+#ifdef USE_VOICE_ASSISTANT_DEBUG_PRE_ROLL
+  void capture_debug_pre_roll_(size_t keep_bytes);
+  void upload_debug_pre_roll_();
+  static void debug_upload_task_(void *arg);
+  uint8_t *debug_pre_roll_[2]{nullptr, nullptr};  // one buffer per channel, in PSRAM
+  size_t debug_pre_roll_capacity_{0};
+  size_t debug_pre_roll_len_{0};       // bytes per channel in the current capture
+  size_t debug_pre_roll_channels_{0};
+  bool debug_pre_roll_pending_{false};  // captured, waiting for the request to end
+  uint32_t debug_pre_roll_captured_at_{0};
+  std::atomic<bool> debug_upload_busy_{false};
+  TaskHandle_t debug_upload_task_handle_{nullptr};
+#endif
   void deallocate_buffers_();
 
   void set_state_(State state);

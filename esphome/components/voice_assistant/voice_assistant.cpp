@@ -10,6 +10,11 @@
 #include <cinttypes>
 #include <cstdio>
 
+#ifdef USE_VOICE_ASSISTANT_DEBUG_PRE_ROLL
+#include <esp_crt_bundle.h>
+#include <esp_http_client.h>
+#endif
+
 namespace esphome::voice_assistant {
 
 static const char *const TAG = "voice_assistant";
@@ -38,6 +43,32 @@ static const uint32_t AUDIO_CHANNEL_STALL_TIMEOUT_MS = 2000;
 VoiceAssistant::VoiceAssistant() { global_voice_assistant = this; }
 
 void VoiceAssistant::setup() {
+#ifdef USE_VOICE_ASSISTANT_DEBUG_PRE_ROLL
+  // Local patch: buffers and a task for the debug pre-roll upload.
+  if (this->debug_pre_roll_max_ms_ > 0 && this->debug_pre_roll_url_ != nullptr) {
+    this->debug_pre_roll_capacity_ = this->debug_pre_roll_max_ms_ * SAMPLE_RATE_HZ / 1000 * sizeof(int16_t);
+    RAMAllocator<uint8_t> allocator;
+    bool ok = (this->debug_pre_roll_[0] = allocator.allocate(this->debug_pre_roll_capacity_)) != nullptr;
+    if (ok && this->mic_source2_ != nullptr) {
+      ok = (this->debug_pre_roll_[1] = allocator.allocate(this->debug_pre_roll_capacity_)) != nullptr;
+    }
+    if (ok) {
+      ok = xTaskCreate(VoiceAssistant::debug_upload_task_, "va_debug_preroll", 6144, this, 1,
+                       &this->debug_upload_task_handle_) == pdPASS;
+    }
+    if (!ok) {
+      ESP_LOGE(TAG, "Not enough memory for the debug pre-roll; it's off");
+      for (auto &buffer : this->debug_pre_roll_) {
+        if (buffer != nullptr) {
+          allocator.deallocate(buffer, this->debug_pre_roll_capacity_);
+          buffer = nullptr;
+        }
+      }
+      this->debug_upload_task_handle_ = nullptr;
+      this->debug_pre_roll_max_ms_ = this->debug_pre_roll_ms_ = 0;
+    }
+  }
+#endif
   this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
     std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
     if (temp_ring_buffer != nullptr) {
@@ -168,6 +199,15 @@ bool VoiceAssistant::allocate_buffers_() {
 }
 
 size_t VoiceAssistant::ring_buffer_size_() const {
+  // Local patch: with a debug pre-roll the buffer also holds it at the moment of a
+  // wake-word start, when it's copied out, before the pipeline start round trip.
+  // Once older audio is dropped, the extra 512 ms keeps the microphone from
+  // overwriting the capture while it's read.
+  if (this->debug_pre_roll_max_ms_ > 0) {
+    size_t capture = static_cast<size_t>(this->pre_roll_ms_ + this->debug_pre_roll_max_ms_) * SAMPLE_RATE_HZ / 1000 *
+                     sizeof(int16_t);
+    return std::max(PRE_ROLL_RING_BUFFER_SIZE, capture + RING_BUFFER_SIZE);
+  }
   return this->pre_roll_ms_ > 0 ? PRE_ROLL_RING_BUFFER_SIZE : RING_BUFFER_SIZE;
 }
 
@@ -254,6 +294,175 @@ void VoiceAssistant::update_pre_roll_() {
     this->mic_source2_->start();
   }
 }
+
+#ifdef USE_VOICE_ASSISTANT_DEBUG_PRE_ROLL
+// Local patch: copy the audio from just before the kept pre-roll into the debug
+// buffers, for the upload task to send when the request is over. Reads continue
+// from the front, so the capture ends where the kept pre-roll starts, give or
+// take what the microphone added meanwhile, which clear_buffers_(keep_bytes) drops.
+void VoiceAssistant::capture_debug_pre_roll_(size_t keep_bytes) {
+  if (this->debug_pre_roll_ms_ == 0 || this->debug_upload_task_handle_ == nullptr) {
+    return;
+  }
+  if (this->debug_upload_busy_.load()) {
+    ESP_LOGW(TAG, "Debug pre-roll upload still running; not capturing this one");
+    return;
+  }
+  std::shared_ptr<ring_buffer::RingBuffer> rbs[2] = {this->ring_buffer_.lock(), this->ring_buffer2_.lock()};
+  const size_t channels = (rbs[1] != nullptr && this->debug_pre_roll_[1] != nullptr) ? 2 : 1;
+  if (rbs[0] == nullptr) {
+    return;
+  }
+  size_t available = rbs[0]->available();
+  if (channels == 2) {
+    available = std::min(available, rbs[1]->available());
+  }
+  if (available <= keep_bytes) {
+    return;
+  }
+  size_t len = std::min<size_t>(this->debug_pre_roll_ms_ * SAMPLE_RATE_HZ / 1000 * sizeof(int16_t), available - keep_bytes);
+  len = std::min(len, this->debug_pre_roll_capacity_);
+  len -= len % sizeof(int16_t);
+  // Small reads, so the microphone task is never held off for long.
+  static const size_t CHUNK = 1024;
+  for (size_t c = 0; c < channels; c++) {
+    uint8_t *buffer = this->debug_pre_roll_[c];
+    // Drop anything older than the capture, using the buffer as scratch space and
+    // re-checking as the microphone adds audio, so the capture ends where the kept
+    // pre-roll starts. A short wait rides out the microphone task's own reads.
+    size_t available_now;
+    while ((available_now = rbs[c]->available()) > keep_bytes + len) {
+      if (rbs[c]->read(buffer, std::min(available_now - keep_bytes - len, CHUNK), pdMS_TO_TICKS(10)) == 0) {
+        break;
+      }
+    }
+    size_t got = 0;
+    while (got < len) {
+      size_t n = rbs[c]->read(buffer + got, std::min(len - got, CHUNK), pdMS_TO_TICKS(10));
+      if (n == 0) {
+        break;
+      }
+      got += n;
+    }
+    if (got < len) {
+      // Keeping a short channel would leave the channels covering different times.
+      ESP_LOGW(TAG, "Debug pre-roll capture came up short; skipping it");
+      return;
+    }
+  }
+  this->debug_pre_roll_len_ = len;
+  this->debug_pre_roll_channels_ = channels;
+  this->debug_pre_roll_captured_at_ = millis();
+  this->debug_pre_roll_pending_ = true;
+  this->debug_upload_busy_.store(true);
+}
+
+void VoiceAssistant::debug_upload_task_(void *arg) {
+  auto *va = static_cast<VoiceAssistant *>(arg);
+  while (true) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    va->upload_debug_pre_roll_();
+    va->debug_upload_busy_.store(false);
+  }
+}
+
+static bool http_write_all(esp_http_client_handle_t client, const void *data, size_t len) {
+  const char *p = static_cast<const char *>(data);
+  while (len > 0) {
+    int n = esp_http_client_write(client, p, len);
+    if (n <= 0) {
+      return false;
+    }
+    p += n;
+    len -= n;
+  }
+  return true;
+}
+
+// Runs on the upload task. Sends the capture as a 16 kHz 16-bit WAV, one channel
+// per microphone channel, interleaved in small chunks. X-Capture-Age-Ms lets Home
+// Assistant find the pipeline run the capture belongs to. The URL carries the
+// webhook id, so it's never logged.
+void VoiceAssistant::upload_debug_pre_roll_() {
+  const uint32_t channels = this->debug_pre_roll_channels_;
+  const uint32_t samples = this->debug_pre_roll_len_ / sizeof(int16_t);
+  const uint32_t data_bytes = samples * channels * sizeof(int16_t);
+  uint8_t header[44];
+  auto put = [&header](size_t at, uint32_t value, size_t bytes) {
+    for (size_t i = 0; i < bytes; i++) {
+      header[at + i] = (value >> (8 * i)) & 0xff;
+    }
+  };
+  memcpy(header, "RIFF", 4);
+  put(4, 36 + data_bytes, 4);
+  memcpy(header + 8, "WAVEfmt ", 8);
+  put(16, 16, 4);
+  put(20, 1, 2);  // PCM
+  put(22, channels, 2);
+  put(24, SAMPLE_RATE_HZ, 4);
+  put(28, SAMPLE_RATE_HZ * channels * sizeof(int16_t), 4);
+  put(32, channels * sizeof(int16_t), 2);
+  put(34, 16, 2);
+  memcpy(header + 36, "data", 4);
+  put(40, data_bytes, 4);
+
+  esp_http_client_config_t config = {};
+  config.url = this->debug_pre_roll_url_;
+  config.method = HTTP_METHOD_POST;
+  config.timeout_ms = 10000;
+  config.crt_bundle_attach = esp_crt_bundle_attach;  // for an https:// URL
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == nullptr) {
+    ESP_LOGW(TAG, "Debug pre-roll upload: couldn't create an HTTP client");
+    return;
+  }
+  esp_http_client_set_header(client, "Content-Type", "audio/wav");
+  char age[12];
+  snprintf(age, sizeof(age), "%" PRIu32, static_cast<uint32_t>(millis() - this->debug_pre_roll_captured_at_));
+  esp_http_client_set_header(client, "X-Capture-Age-Ms", age);
+  // Lets Home Assistant look only at this device's runs.
+  esp_http_client_set_header(client, "X-Device-MAC", get_mac_address().c_str());
+  const char *failure = nullptr;
+  esp_err_t err = esp_http_client_open(client, sizeof(header) + data_bytes);
+  if (err != ESP_OK) {
+    failure = esp_err_to_name(err);
+  } else if (!http_write_all(client, header, sizeof(header))) {
+    failure = "write failed";
+  }
+  bool ok = failure == nullptr;
+  const int16_t *in[2] = {reinterpret_cast<const int16_t *>(this->debug_pre_roll_[0]),
+                          reinterpret_cast<const int16_t *>(this->debug_pre_roll_[1])};
+  int16_t out[256];
+  for (uint32_t i = 0; ok && i < samples;) {
+    uint32_t n = std::min<uint32_t>(256 / channels, samples - i);
+    for (uint32_t j = 0; j < n; j++) {
+      for (uint32_t c = 0; c < channels; c++) {
+        out[j * channels + c] = in[c][i + j];
+      }
+    }
+    ok = http_write_all(client, out, n * channels * sizeof(int16_t));
+    if (!ok) {
+      failure = "write failed";
+    }
+    i += n;
+  }
+  int status = -1;
+  if (ok) {
+    if (esp_http_client_fetch_headers(client) < 0) {
+      failure = "no response";
+    } else if ((status = esp_http_client_get_status_code(client)) < 200 || status >= 300) {
+      failure = "rejected";
+    }
+  }
+  if (failure == nullptr) {
+    ESP_LOGD(TAG, "Uploaded %" PRIu32 " ms of debug pre-roll", static_cast<uint32_t>(samples * 1000 / SAMPLE_RATE_HZ));
+  } else {
+    ESP_LOGW(TAG, "Debug pre-roll upload failed: %s (HTTP status %d)", failure, status);
+  }
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+}
+#endif
 
 void VoiceAssistant::deallocate_buffers_() {
   // Destroying each source releases its ring buffer; the matching weak_ptr then expires automatically.
@@ -371,6 +580,14 @@ void VoiceAssistant::loop() {
   }
   switch (this->state_) {
     case State::IDLE: {
+#ifdef USE_VOICE_ASSISTANT_DEBUG_PRE_ROLL
+      // Local patch: upload a debug pre-roll once its request is over, so it
+      // doesn't compete with the voice stream.
+      if (this->debug_pre_roll_pending_) {
+        this->debug_pre_roll_pending_ = false;
+        xTaskNotifyGive(this->debug_upload_task_handle_);
+      }
+#endif
       if (this->continuous_ && this->desired_state_ == State::IDLE) {
         this->idle_trigger_.trigger();
         this->set_state_(State::START_MICROPHONE, State::START_PIPELINE);
@@ -394,7 +611,11 @@ void VoiceAssistant::loop() {
       // Local patch: keep the pre-roll only for a wake-word start. A button press,
       // a Home Assistant-initiated start or a follow-up turn starts clean, as stock.
       if (this->pre_roll_ms_ > 0 && !this->wake_word_.empty() && !this->continue_conversation_) {
-        this->clear_buffers_(this->pre_roll_ms_ * SAMPLE_RATE_HZ / 1000 * sizeof(int16_t));
+        size_t keep_bytes = this->pre_roll_ms_ * SAMPLE_RATE_HZ / 1000 * sizeof(int16_t);
+#ifdef USE_VOICE_ASSISTANT_DEBUG_PRE_ROLL
+        this->capture_debug_pre_roll_(keep_bytes);
+#endif
+        this->clear_buffers_(keep_bytes);
       } else {
         this->clear_buffers_();
       }

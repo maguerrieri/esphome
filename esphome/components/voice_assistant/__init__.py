@@ -48,6 +48,8 @@ CONF_WAKE_WORD = "wake_word"
 CONF_CONVERSATION_TIMEOUT = "conversation_timeout"
 # Local patch (maguerrieri/home voice-pe/): see PRE_ROLL.md.
 CONF_PRE_ROLL = "pre_roll"
+CONF_DEBUG_PRE_ROLL = "debug_pre_roll"
+CONF_DEBUG_PRE_ROLL_URL = "debug_pre_roll_url"
 
 CONF_ON_TIMER_STARTED = "on_timer_started"
 CONF_ON_TIMER_UPDATED = "on_timer_updated"
@@ -72,6 +74,20 @@ def tts_stream_validate(config: ConfigType) -> ConfigType:
         raise cv.Invalid(
             f"{CONF_SPEAKER} is required when using {CONF_ON_TTS_STREAM_START} and/or {CONF_ON_TTS_STREAM_END}"
         )
+    return config
+
+
+def _validate_debug_pre_roll(config):
+    from esphome.core import CORE
+
+    if config[CONF_DEBUG_PRE_ROLL].total_milliseconds == 0:
+        return config
+    if CONF_DEBUG_PRE_ROLL_URL not in config:
+        raise cv.Invalid(f"{CONF_DEBUG_PRE_ROLL} needs {CONF_DEBUG_PRE_ROLL_URL}")
+    if config[CONF_PRE_ROLL].total_milliseconds == 0:
+        raise cv.Invalid(f"{CONF_DEBUG_PRE_ROLL} needs {CONF_PRE_ROLL}")
+    if not CORE.is_esp32:
+        raise cv.Invalid(f"{CONF_DEBUG_PRE_ROLL} needs an ESP32")
     return config
 
 
@@ -101,11 +117,19 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_USE_WAKE_WORD, default=False): cv.boolean,
             # Keep this much audio from before a wake-word start, so a command said
             # straight after an on-device wake word keeps its first word. The ring
-            # buffer (1536 ms when this is set) also has to hold the pipeline start.
+            # buffer (1536 ms, or more with debug_pre_roll) also holds the pipeline start.
             cv.Optional(CONF_PRE_ROLL, default="0ms"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(max=cv.TimePeriod(milliseconds=500)),
             ),
+            # Audio from before the pre-roll, uploaded as a WAV to
+            # debug_pre_roll_url after a wake-word start and never sent to
+            # speech-to-text, so missed wake words end up in a file.
+            cv.Optional(CONF_DEBUG_PRE_ROLL, default="0ms"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(max=cv.TimePeriod(milliseconds=5000)),
+            ),
+            cv.Optional(CONF_DEBUG_PRE_ROLL_URL): cv.url,
             cv.Optional(CONF_MICRO_WAKE_WORD): cv.use_id(micro_wake_word.MicroWakeWord),
             cv.Optional(CONF_VAD_THRESHOLD): cv.invalid(
                 "VAD threshold is no longer supported, as it requires the deprecated esp_adf external component. Use an i2s_audio microphone/speaker instead. Additionally, you may need to configure the audio_adc and audio_dac components depending on your hardware."
@@ -177,6 +201,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
     tts_stream_validate,
+    _validate_debug_pre_roll,
 )
 
 FINAL_VALIDATE_SCHEMA = cv.All(
@@ -220,6 +245,13 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_use_wake_word(config[CONF_USE_WAKE_WORD]))
 
     cg.add(var.set_pre_roll_ms(config[CONF_PRE_ROLL].total_milliseconds))
+    if (debug_pre_roll_ms := config[CONF_DEBUG_PRE_ROLL].total_milliseconds) > 0:
+        from esphome.components import esp32
+
+        cg.add_define("USE_VOICE_ASSISTANT_DEBUG_PRE_ROLL")
+        esp32.include_builtin_idf_component("esp_http_client")
+        cg.add(var.set_debug_pre_roll_max_ms(debug_pre_roll_ms))
+        cg.add(var.set_debug_pre_roll_url(config[CONF_DEBUG_PRE_ROLL_URL]))
 
     if (vad_threshold := config.get(CONF_VAD_THRESHOLD)) is not None:
         cg.add(var.set_vad_threshold(vad_threshold))
