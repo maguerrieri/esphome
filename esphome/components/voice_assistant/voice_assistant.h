@@ -186,6 +186,8 @@ class VoiceAssistant final : public Component {
   bool is_running_or_continuous() const { return this->is_running() || this->is_continuous(); }
 
   void set_use_wake_word(bool use_wake_word) { this->use_wake_word_ = use_wake_word; }
+  // Local patch: audio kept from before a wake-word start (0 = stock behavior).
+  void set_pre_roll_ms(uint32_t pre_roll_ms) { this->pre_roll_ms_ = pre_roll_ms; }
 
   void set_noise_suppression_level(uint8_t noise_suppression_level) {
     this->noise_suppression_level_ = noise_suppression_level;
@@ -232,7 +234,12 @@ class VoiceAssistant final : public Component {
 
  protected:
   bool allocate_buffers_();
-  void clear_buffers_();
+  // Local patch: keep_bytes > 0 keeps the newest keep_bytes of microphone audio.
+  void clear_buffers_(size_t keep_bytes = 0);
+  void update_pre_roll_();
+  size_t ring_buffer_size_() const;
+  uint32_t pre_roll_ms_{0};
+  bool pre_roll_alloc_failed_{false};
   void deallocate_buffers_();
 
   void set_state_(State state);

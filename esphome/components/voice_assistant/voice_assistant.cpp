@@ -22,6 +22,9 @@ static const size_t SAMPLE_RATE_HZ = 16000;
 
 static const size_t RING_BUFFER_SAMPLES = 512 * SAMPLE_RATE_HZ / 1000;  // 512 ms * 16 kHz/ 1000 ms
 static const size_t RING_BUFFER_SIZE = RING_BUFFER_SAMPLES * sizeof(int16_t);
+// Local patch: with pre_roll the buffer holds the pre-roll plus everything recorded
+// while Home Assistant starts the pipeline, so it's three times the stock size.
+static const size_t PRE_ROLL_RING_BUFFER_SIZE = 3 * RING_BUFFER_SIZE;  // 1536 ms
 static const size_t SEND_BUFFER_SAMPLES = 32 * SAMPLE_RATE_HZ / 1000;  // 32ms * 16kHz / 1000ms
 static const size_t SEND_BUFFER_SIZE = SEND_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t RECEIVE_SIZE = 1024;
@@ -132,7 +135,7 @@ bool VoiceAssistant::allocate_buffers_() {
 #endif
 
   if (this->audio_source_ == nullptr) {
-    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(RING_BUFFER_SIZE);
+    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(this->ring_buffer_size_());
     if (temp_ring_buffer == nullptr) {
       ESP_LOGE(TAG, "Could not allocate ring buffer");
       return false;
@@ -148,7 +151,7 @@ bool VoiceAssistant::allocate_buffers_() {
 
   // Second microphone channel
   if ((this->mic_source2_ != nullptr) && (this->audio_source2_ == nullptr)) {
-    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(RING_BUFFER_SIZE);
+    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(this->ring_buffer_size_());
     if (temp_ring_buffer == nullptr) {
       ESP_LOGE(TAG, "Could not allocate second ring buffer");
       return false;
@@ -164,14 +167,40 @@ bool VoiceAssistant::allocate_buffers_() {
   return true;
 }
 
-void VoiceAssistant::clear_buffers_() {
-  if (this->audio_source_ != nullptr) {
-    this->audio_source_->clear_buffered_data();
-  }
+size_t VoiceAssistant::ring_buffer_size_() const {
+  return this->pre_roll_ms_ > 0 ? PRE_ROLL_RING_BUFFER_SIZE : RING_BUFFER_SIZE;
+}
 
-  // Second microphone channel
-  if (this->audio_source2_ != nullptr) {
-    this->audio_source2_->clear_buffered_data();
+void VoiceAssistant::clear_buffers_(size_t keep_bytes) {
+  if (keep_bytes == 0) {
+    if (this->audio_source_ != nullptr) {
+      this->audio_source_->clear_buffered_data();
+    }
+
+    // Second microphone channel
+    if (this->audio_source2_ != nullptr) {
+      this->audio_source2_->clear_buffered_data();
+    }
+  } else {
+    // Local patch: drop all but the newest keep_bytes. Nothing reads the ring
+    // buffers while idle, and update_pre_roll_() cleared them (releasing any item
+    // a source still held) when the microphone restarted, so plain reads are safe.
+    uint8_t scratch[1024];
+    for (const auto &weak : {this->ring_buffer_, this->ring_buffer2_}) {
+      std::shared_ptr<ring_buffer::RingBuffer> rb = weak.lock();
+      if (rb == nullptr) {
+        continue;
+      }
+      size_t available = rb->available();
+      while (available > keep_bytes) {
+        size_t chunk = std::min(sizeof(scratch), available - keep_bytes);
+        chunk -= chunk % sizeof(int16_t);
+        if (chunk == 0 || rb->read(scratch, chunk) == 0) {
+          break;
+        }
+        available = rb->available();
+      }
+    }
   }
 
   // Reset the multi-channel stall watchdog (see audio_channel_stall_start_).
@@ -186,6 +215,44 @@ void VoiceAssistant::clear_buffers_() {
     this->speaker_bytes_received_ = 0;
   }
 #endif
+}
+
+// Local patch: while idle, keep the microphone sources and ring buffers running
+// so they always hold the latest audio (RingBuffer::write drops the oldest bytes
+// when full), but only while the on-device wake word is listening and Home
+// Assistant is connected, the only times a wake-word start can happen.
+void VoiceAssistant::update_pre_roll_() {
+#ifdef USE_MICRO_WAKE_WORD
+  bool wanted =
+      this->api_client_ != nullptr && this->micro_wake_word_ != nullptr && this->micro_wake_word_->is_running();
+#else
+  bool wanted = false;  // no on-device wake word, so no wake-word start to pre-roll for
+#endif
+  bool running = this->mic_source_->is_running() || (this->mic_source2_ && this->mic_source2_->is_running());
+  if (!wanted) {
+    if (running) {
+      this->mic_source_->stop();
+      if (this->mic_source2_) {
+        this->mic_source2_->stop();
+      }
+    }
+    this->deallocate_buffers_();
+    return;
+  }
+  if (running || this->pre_roll_alloc_failed_) {
+    return;
+  }
+  if (!this->allocate_buffers_()) {
+    // Don't retry every loop; the next pipeline start allocates (and logs) again.
+    this->pre_roll_alloc_failed_ = true;
+    return;
+  }
+  // Fresh start: drop audio and any item a source still holds from the last request.
+  this->clear_buffers_();
+  this->mic_source_->start();
+  if (this->mic_source2_) {
+    this->mic_source2_->start();
+  }
 }
 
 void VoiceAssistant::deallocate_buffers_() {
@@ -307,6 +374,8 @@ void VoiceAssistant::loop() {
       if (this->continuous_ && this->desired_state_ == State::IDLE) {
         this->idle_trigger_.trigger();
         this->set_state_(State::START_MICROPHONE, State::START_PIPELINE);
+      } else if (this->pre_roll_ms_ > 0) {
+        this->update_pre_roll_();
       } else {
         this->deallocate_buffers_();
       }
@@ -321,7 +390,14 @@ void VoiceAssistant::loop() {
       if (this->status_has_error()) {
         this->status_clear_error();
       }
-      this->clear_buffers_();
+      this->pre_roll_alloc_failed_ = false;
+      // Local patch: keep the pre-roll only for a wake-word start. A button press,
+      // a Home Assistant-initiated start or a follow-up turn starts clean, as stock.
+      if (this->pre_roll_ms_ > 0 && !this->wake_word_.empty() && !this->continue_conversation_) {
+        this->clear_buffers_(this->pre_roll_ms_ * SAMPLE_RATE_HZ / 1000 * sizeof(int16_t));
+      } else {
+        this->clear_buffers_();
+      }
 
       this->mic_source_->start();
       if (this->mic_source2_) {
