@@ -91,20 +91,46 @@ def _validate_debug_pre_roll(config):
     return config
 
 
-# Local patch: an external component built from the ESPHome release below, with
-# the rest of that release (maguerrieri/home voice-pe/PRE_ROLL.md), so it refuses
-# to build with any other. Every merge of a new release into voice-pe updates it.
-MERGED_ESPHOME_RELEASE = "2026.10.1"
+# Local patch: this component is built with the rest of the ESPHome release that
+# voice-pe last merged (maguerrieri/home voice-pe/PRE_ROLL.md), so it refuses to
+# build with any other. It reads that release from the esphome/const.py beside
+# esphome/components/ in the same tree, which every merge updates.
+def _merged_esphome_release() -> str | None:
+    import ast
+    from pathlib import Path
+
+    const = Path(__file__).resolve().parents[2] / "const.py"
+    try:
+        tree = ast.parse(const.read_text())
+    except (OSError, SyntaxError):
+        return None
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            return node.value.value
+    return None
 
 
 def _validate_esphome_version(config):
     from esphome.const import __version__
 
-    if __version__ != MERGED_ESPHOME_RELEASE:
+    merged = _merged_esphome_release()
+    if merged is None:
         raise cv.Invalid(
-            f"This voice_assistant is maguerrieri/esphome's voice-pe for ESPHome "
-            f"{MERGED_ESPHOME_RELEASE}, but this is ESPHome {__version__}. Load the "
-            "voice-pe tag for this version, merging the release first if there isn't one: "
+            "This voice_assistant is maguerrieri/esphome's voice-pe, but there's no "
+            "esphome/const.py beside it to say which ESPHome release it was merged with. "
+            "Load it from the fork itself: "
+            '"Upgrading ESPHome" in voice-pe/PRE_ROLL.md, in maguerrieri/home.'
+        )
+    if __version__ != merged:
+        raise cv.Invalid(
+            f"This voice_assistant is maguerrieri/esphome's voice-pe for ESPHome {merged}, "
+            f"but this is ESPHome {__version__}. Load the commit of a voice-pe tag for "
+            "this version, merging the release first if there isn't one: "
             '"Upgrading ESPHome" in voice-pe/PRE_ROLL.md, in maguerrieri/home.'
         )
     return config
