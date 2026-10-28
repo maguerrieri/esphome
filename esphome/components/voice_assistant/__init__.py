@@ -91,7 +91,27 @@ def _validate_debug_pre_roll(config):
     return config
 
 
+# Local patch: an external component built from the ESPHome release below, with
+# the rest of that release (maguerrieri/home voice-pe/PRE_ROLL.md), so it refuses
+# to build with any other. Every merge of a new release into voice-pe updates it.
+MERGED_ESPHOME_RELEASE = "2026.10.1"
+
+
+def _validate_esphome_version(config):
+    from esphome.const import __version__
+
+    if __version__ != MERGED_ESPHOME_RELEASE:
+        raise cv.Invalid(
+            f"This voice_assistant is maguerrieri/esphome's voice-pe for ESPHome "
+            f"{MERGED_ESPHOME_RELEASE}, but this is ESPHome {__version__}. Load the "
+            "voice-pe tag for this version, merging the release first if there isn't one: "
+            '"Upgrading ESPHome" in voice-pe/PRE_ROLL.md, in maguerrieri/home.'
+        )
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
+    _validate_esphome_version,
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(VoiceAssistant),
